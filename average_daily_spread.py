@@ -10,6 +10,14 @@ PRICE_COL = "Day Ahead Auction (CH)"
 # now load multiple CSVs
 CSV_PATHS = [f"datasets/spot/energy-charts_Electricity_production_and_spot_prices_in_Switzerland_in_{year}.csv" for year in years]
 
+# CKW dataset (hourly end-user prices, CHF/kWh).
+CKW_CSV_PATH = "datasets/ckw_dynamic_home_tariff_hourly.csv"
+CKW_PRICE_COL = "integrated"  # total end price
+
+# EKZ dataset (hourly dynamic tariff, CHF/kWh). Timestamps already Swiss-local.
+EKZ_CSV_PATH = "ekz_dynamic_2026_hourly.csv"
+EKZ_PRICE_COL = "avg_price_chf_kwh"
+
 # CO2 carbon intensity dataset (hourly, Switzerland 2025).
 CO2_CSV_PATH = "datasets/snapshots_2026-02-10_CH-2025-hourly.csv"
 CO2_COLS = {
@@ -50,8 +58,6 @@ def main():
     df["year"] = df["Date (GMT+1)"].dt.year
     daily = df.groupby(["year", "day"])[PRICE_COL].agg(lambda s: s.max() - s.min())
     yearly_spread = daily.groupby(level="year").mean()    # 2. fit linear regression to the yearly average daily spread data
-    from sklearn.linear_model import LinearRegression
-    import numpy as np
     X = yearly_spread.index.values.reshape(-1, 1)
     y = yearly_spread.values
     model = LinearRegression()
@@ -137,6 +143,84 @@ def main():
         std_co2 = valid[col].std()
         print(f"Standard deviation of daily CO2 emissions ({label}): {std_co2:.2f} gCO2eq/kWh")
 
+    # --- CKW daily price spread: max - min per calendar day, averaged by year. ---
+    # Same calculation as the day-ahead spread, on the 'integrated' (total end
+    # price) column, computed separately for 2025 and 2026.
+    ckw = pd.read_csv(CKW_CSV_PATH)
+    ckw_ts = pd.to_datetime(ckw["hour_start"], utc=True)
+    ckw_ts = ckw_ts.dt.tz_convert("Europe/Zurich")
+    ckw["day"] = ckw_ts.dt.date
+    ckw["year"] = ckw_ts.dt.year
+    ckw["hour"] = ckw_ts.dt.hour
+    ckw[CKW_PRICE_COL] = pd.to_numeric(ckw[CKW_PRICE_COL], errors="coerce")
+    ckw = ckw.dropna(subset=[CKW_PRICE_COL])
+
+    avg_ckw_spread = {}
+    for year in (2025, 2026):
+        year_df = ckw[ckw["year"] == year]
+        ckw_daily_spread = year_df.groupby("day")[CKW_PRICE_COL].agg(lambda s: s.max() - s.min())
+        avg_ckw_spread[year] = ckw_daily_spread.mean()
+
+    # --- CKW nightly spread: hours 20:00-05:59, attributed to night start day. ---
+    ckw_night = ckw[(ckw["hour"] >= 20) | (ckw["hour"] < 6)].copy()
+    ckw_night["night"] = ckw_night.apply(
+        lambda r: r["day"] if r["hour"] >= 20 else r["day"] - pd.Timedelta(days=1),
+        axis=1,
+    )
+    avg_ckw_nightly_spread = ckw_night.groupby("night")[CKW_PRICE_COL].agg(
+        lambda s: s.max() - s.min()
+    ).mean()
+
+    # --- CKW tolerant spread: hours 20:00-07:59, attributed to night start day. ---
+    ckw_tolerant = ckw[(ckw["hour"] >= 20) | (ckw["hour"] < 8)].copy()
+    ckw_tolerant["tolerant"] = ckw_tolerant.apply(
+        lambda r: r["day"] if r["hour"] >= 20 else r["day"] - pd.Timedelta(days=1),
+        axis=1,
+    )
+    avg_ckw_tolerant_spread = ckw_tolerant.groupby("tolerant")[CKW_PRICE_COL].agg(
+        lambda s: s.max() - s.min()
+    ).mean()
+
+    # --- EKZ daily price spread: max - min per calendar day, averaged by year. ---
+    # Same calculation as CKW, on the hourly dynamic tariff (CHF/kWh).
+    ekz = pd.read_csv(EKZ_CSV_PATH)
+    # 'hour' column is ISO 8601 with Swiss offset; utc=True then convert back to
+    # local so day boundaries and hour-of-day match the wall clock (handles DST).
+    ekz_ts = pd.to_datetime(ekz["hour"], utc=True).dt.tz_convert("Europe/Zurich")
+    ekz["day"] = ekz_ts.dt.date
+    ekz["year"] = ekz_ts.dt.year
+    ekz["hour"] = ekz_ts.dt.hour
+    ekz[EKZ_PRICE_COL] = pd.to_numeric(ekz[EKZ_PRICE_COL], errors="coerce")
+    ekz = ekz.dropna(subset=[EKZ_PRICE_COL])
+
+    avg_ekz_spread = {}
+    for year in (2025, 2026):
+        year_df = ekz[ekz["year"] == year]
+        if year_df.empty:
+            continue
+        ekz_daily_spread = year_df.groupby("day")[EKZ_PRICE_COL].agg(lambda s: s.max() - s.min())
+        avg_ekz_spread[year] = ekz_daily_spread.mean()
+
+    # --- EKZ nightly spread: hours 20:00-05:59, attributed to night start day. ---
+    ekz_night = ekz[(ekz["hour"] >= 20) | (ekz["hour"] < 6)].copy()
+    ekz_night["night"] = ekz_night.apply(
+        lambda r: r["day"] if r["hour"] >= 20 else r["day"] - pd.Timedelta(days=1),
+        axis=1,
+    )
+    avg_ekz_nightly_spread = ekz_night.groupby("night")[EKZ_PRICE_COL].agg(
+        lambda s: s.max() - s.min()
+    ).mean()
+
+    # --- EKZ tolerant spread: hours 20:00-07:59, attributed to night start day. ---
+    ekz_tolerant = ekz[(ekz["hour"] >= 20) | (ekz["hour"] < 8)].copy()
+    ekz_tolerant["tolerant"] = ekz_tolerant.apply(
+        lambda r: r["day"] if r["hour"] >= 20 else r["day"] - pd.Timedelta(days=1),
+        axis=1,
+    )
+    avg_ekz_tolerant_spread = ekz_tolerant.groupby("tolerant")[EKZ_PRICE_COL].agg(
+        lambda s: s.max() - s.min()
+    ).mean()
+
     print(f"Number of days: {len(daily_spread)}")
     print(f"Average daily price spread:   {avg_spread:.2f} EUR/MWh")
     print(f"Number of nights: {len(nightly_spread)}")
@@ -146,6 +230,19 @@ def main():
 
     print(f"Average daily CO2 spread (direct):     {avg_co2_spread['direct']:.2f} gCO2eq/kWh")
     print(f"Average daily CO2 spread (life cycle): {avg_co2_spread['life cycle']:.2f} gCO2eq/kWh")
+
+    print('--- CKW daily price spread ---')
+
+    print(f"Average daily CKW price spread (2025): {avg_ckw_spread[2025]:.4f} CHF/kWh")
+    print(f"Average daily CKW price spread (2026): {avg_ckw_spread[2026]:.4f} CHF/kWh")
+    print(f"Average nightly CKW price spread: {avg_ckw_nightly_spread:.4f} CHF/kWh")
+    print(f"Average tolerant CKW price spread: {avg_ckw_tolerant_spread:.4f} CHF/kWh")
+
+    print('--- EKZ daily price spread ---')
+    for year in sorted(avg_ekz_spread):
+        print(f"Average daily EKZ price spread ({year}): {avg_ekz_spread[year]:.4f} CHF/kWh")
+    print(f"Average nightly EKZ price spread: {avg_ekz_nightly_spread:.4f} CHF/kWh")
+    print(f"Average tolerant EKZ price spread: {avg_ekz_tolerant_spread:.4f} CHF/kWh")
  
  
 if __name__ == "__main__":
